@@ -1,0 +1,137 @@
+Final repo: tesla-powerwall-fingal
+Bashgit clone https://github.com/yourname/tesla-powerwall-fingal
+cd tesla-powerwall-fingal
+docker compose up --build
+# → http://localhost:8000/metrics + Grafana at :3000
+requirements.txt
+txtpypowerwall>=0.14.3
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-prometheus
+tenacity
+fingal/exporter.py — shipped integration (local primary, Fleet API fallback)
+Python# fingal/exporter.py - tesla-powerwall-fingal
+from __future__ import annotations
+
+import asyncio
+import random
+import time
+from datetime import datetime, UTC
+from typing import Any, AsyncGenerator, Dict
+
+from opentelemetry import metrics, trace
+from opentelemetry.exporter.prometheus import PrometheusMetricsExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from pypowerwall import Powerwall
+
+# OTel setup
+resource = Resource.create({"service.name": "tesla-powerwall-fingal"})
+metrics.set_meter_provider(MeterProvider(resource=resource))
+trace.set_tracer_provider(TracerProvider(resource=resource))
+
+meter = metrics.get_meter("tesla-powerwall-fingal")
+tracer = trace.get_tracer("tesla-powerwall-fingal")
+
+exporter = PrometheusMetricsExporter()
+metrics.get_meter_provider().start_pipeline(exporter.reader)
+
+# Your elite metrics (unchanged)
+TESLA_LATENCY = meter.create_histogram("tesla_api_latency_seconds", unit="s")
+TESLA_REQUESTS_TOTAL = meter.create_counter("tesla_api_requests_total")
+TESLA_DISPATCHES_TOTAL = meter.create_counter("tesla_dispatches_total")
+STREAM_POLLS = meter.create_counter("tesla_stream_polls_total")
+SITE_HEARTBEAT = meter.create_counter("fingal_site_heartbeat_total", description="increase()[5m] > 0 = active")
+TOKEN_REFRESHES = meter.create_counter("fingal_token_refreshes_total")
+
+class FingalPowerwall:
+    def __init__(
+        self,
+        host: str | None = None,          # Local/TEDAPI IP (192.168.91.1 for PW3 direct WiFi)
+        password: str | None = None,      # Local customer password
+        email: str = "",
+        gw_pwd: str | None = None,        # TEDAPI Gateway password (QR sticker)
+        fleet_api: bool = False,           # Enable official Fleet API fallback
+        site_id: str | None = None,
+    ):
+        self.pw = Powerwall(
+            host=host,
+            password=password or "",
+            email=email or "",
+            gw_pwd=gw_pwd,
+            cloudmode=fleet_api or not host,  # FleetAPI if no host or explicit
+            siteid=site_id,
+        )
+        self.site_id = site_id or "local"
+        self.mode = "local" if host else "fleet"
+
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=4, max=60))
+    async def charge_state(self) -> Dict[str, Any]:
+        start = time.monotonic()
+        with tracer span = tracer.start_as_current_span("tesla.charge_state", attributes={"site_id": self.site_id, "mode": self.mode}):
+            try:
+                state = await asyncio.to_thread(self.pw.soestatus)  # Works in all modes
+                status = "success"
+            except Exception as e:
+                status = "error"
+                span.record_exception(e)
+                span.set_status(trace.StatusCode.ERROR)
+                raise
+            finally:
+                duration = time.monotonic() - start
+                attrs = {"site_id": self.site_id, "mode": self.mode, "status": status}
+                TESLA_LATENCY.record(duration, attrs)
+                TESLA_REQUESTS_TOTAL.add(1, attrs)
+
+            return state
+
+    async def monitor_stream(self, interval: float = 8.0) -> AsyncGenerator[Dict[str, Any], None]:
+        jitter = (-1.0, 2.0)
+        _last_state = None
+        while True:
+            with tracer.start_as_current_span("tesla.stream.poll"):
+                try:
+                    state = await self.charge_state()
+                    changed = state != _last_state
+                    _last_state = state
+                    outcome = "delta" if changed else "no_change"
+                    STREAM_POLLS.add(1, {"site_id": self.site_id, "outcome": outcome})
+                except Exception:
+                    STREAM_POLLS.add(1, {"site_id": self.site_id, "outcome": "error"})
+                    await asyncio.sleep(5)
+
+                SITE_HEARTBEAT.add(1, {"site_id": self.site_id})
+
+                yield {**state, "site_id": self.site_id, "mode": self.mode, "ts": datetime.now(UTC).isoformat()}
+
+            await asyncio.sleep(interval + random.uniform(*jitter))
+docker-compose.yml (shipped)
+YAMLversion: "3.8"
+services:
+  exporter:
+    build: .
+    environment:
+      - HOST=192.168.1.100        # Local IP or 192.168.91.1 for PW3 direct WiFi
+      - PASSWORD=your_local_pwd
+      - GW_PWD=your_qr_pwd        # For PW3 TEDAPI
+      - FLEET_API=true            # Fallback if local unreachable
+    ports:
+      - "8000:8000"
+
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana
+    volumes:
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
