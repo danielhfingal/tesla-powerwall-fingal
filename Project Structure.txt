@@ -1,0 +1,9 @@
+tesla-powerwall-fingal/
+├── fingal/
+│   └── exporter.py          # Main exporter (copy below)
+├── grafana/
+│   └── fingal-powerwall.json # Dashboard JSON (from earlier)
+├── requirements.txt         # Dependencies
+├── docker-compose.yml       # Docker setup
+├── README.md               # From earlier
+└── LICENSE                 # MIT

@@ -1,0 +1,8 @@
+pypowerwall>=0.14.3
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-prometheus
+fastapi
+uvicorn[standard]
+orjson
+tenacity
